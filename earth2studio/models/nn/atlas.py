@@ -19,8 +19,6 @@ import math
 from enum import Enum
 from functools import cache, partial
 from timeit import default_timer
-from collections.abc import Callable
-from typing import Optional
 
 import numpy as np
 import torch
@@ -1041,11 +1039,10 @@ class Attention(nn.Module):
         self.proj = torch.nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = torch.nn.Dropout(proj_drop)
 
-    def forward(self, x: torch.Tensor, weight_transform: Optional[Callable] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
-        qkv_transformed = weight_transform(self.qkv(x)) if weight_transform else self.qkv(x)
         qkv = (
-            qkv_transformed(x)
+            self.qkv(x)
             .reshape(B, N, 3, self.num_heads, self.head_dim)
             .permute(2, 0, 3, 1, 4)
         )
@@ -1100,12 +1097,12 @@ class DiTBlock(nn.Module):
             torch.nn.SiLU(), torch.nn.Linear(hidden_dim, 6 * hidden_dim, bias=True)
         )
 
-    def forward(self, x, c, attn_weight_transform: Optional[Callable] = None):
+    def forward(self, x, c):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=1)
         )
         x = x + gate_msa.unsqueeze(1) * self.attn(
-            modulate(self.norm1(x), shift_msa, scale_msa), attn_weight_transform
+            modulate(self.norm1(x), shift_msa, scale_msa)
         )
         x = x + gate_mlp.unsqueeze(1) * self.mlp(
             modulate(self.norm2(x), shift_mlp, scale_mlp)

@@ -15,8 +15,6 @@
 # limitations under the License.
 
 from functools import partial
-from typing import Optional
-from collections.abc import Callable
 
 import torch
 import torch.nn as nn
@@ -111,8 +109,7 @@ class EnsembleDiTBlock(DiTBlock):
         )
 
     def forward(
-        self, x: torch.Tensor, c: torch.Tensor, z: torch.Tensor,
-        attn_weight_transform: Optional[Callable] = None
+        self, x: torch.Tensor, c: torch.Tensor, z: torch.Tensor
     ) -> torch.Tensor:
         """Apply the block to tokens `x` conditioned on `c` and noise `z`."""
         modulation = self.adaLN_modulation(c) + self.noise_modulation(z)
@@ -120,7 +117,7 @@ class EnsembleDiTBlock(DiTBlock):
             modulation.chunk(6, dim=1)
         )
         x = x + gate_msa.unsqueeze(1) * self.attn(
-            modulate(self.norm1(x), shift_msa, scale_msa), attn_weight_transform
+            modulate(self.norm1(x), shift_msa, scale_msa)
         )
         x = x + gate_mlp.unsqueeze(1) * self.mlp(
             modulate(self.norm2(x), shift_mlp, scale_mlp)
@@ -280,7 +277,6 @@ class CRPSLatentDiT(PhysicsNeMoModule):
         x_2: torch.Tensor,
         t: torch.Tensor | None = None,
         z_noise: torch.Tensor | None = None,
-        attn_weight_transform: Optional[Callable] = None
     ) -> torch.Tensor:
         """Predict a normalized residual from the two input streams.
 
@@ -314,7 +310,7 @@ class CRPSLatentDiT(PhysicsNeMoModule):
         z_noise = self.noise_mlp(z_noise)
 
         for block in self.blocks:
-            x = block(x, cond, z_noise, attn_weight_transform)
+            x = block(x, cond, z_noise)
 
         x = self.final_layer(x, cond)
         x = self.unpatchify(x)

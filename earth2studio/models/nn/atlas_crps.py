@@ -99,7 +99,7 @@ class EnsembleDiTBlock(DiTBlock):
         hidden_dim: int,
         num_heads: int,
         mlp_ratio: float = 4.0,
-        **block_kwargs: bool,
+        **block_kwargs: bool | type[nn.Module] | None,
     ) -> None:
         super().__init__(
             hidden_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, **block_kwargs
@@ -109,7 +109,11 @@ class EnsembleDiTBlock(DiTBlock):
         )
 
     def forward(
-        self, x: torch.Tensor, c: torch.Tensor, z: torch.Tensor
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        z: torch.Tensor,
+        coarsening_level: int = 0,
     ) -> torch.Tensor:
         """Apply the block to tokens `x` conditioned on `c` and noise `z`."""
         modulation = self.adaLN_modulation(c) + self.noise_modulation(z)
@@ -117,7 +121,7 @@ class EnsembleDiTBlock(DiTBlock):
             modulation.chunk(6, dim=1)
         )
         x = x + gate_msa.unsqueeze(1) * self.attn(
-            modulate(self.norm1(x), shift_msa, scale_msa)
+            modulate(self.norm1(x), shift_msa, scale_msa), coarsening_level
         )
         x = x + gate_mlp.unsqueeze(1) * self.mlp(
             modulate(self.norm2(x), shift_mlp, scale_mlp)
@@ -185,6 +189,10 @@ class CRPSLatentDiT(PhysicsNeMoModule):
         Normalize queries and keys, by default False
     bfloat_cast : bool, optional
         Compute attention in bfloat16, by default True
+    attn_weight_transform : type[nn.Module] | None, optional
+        Module class instantiated in each attention layer and called with the qkv
+        projection and the coarsening level, returning the projection to apply.
+        If None, the qkv projection is used unchanged, by default None
     """
 
     def __init__(
@@ -202,6 +210,7 @@ class CRPSLatentDiT(PhysicsNeMoModule):
         mlp_ratio: float = 4.0,
         qk_norm: bool = False,
         bfloat_cast: bool = True,
+        attn_weight_transform: type[nn.Module] | None = None,
     ) -> None:
         super().__init__()
 
@@ -250,6 +259,7 @@ class CRPSLatentDiT(PhysicsNeMoModule):
                     mlp_ratio=mlp_ratio,
                     qk_norm=qk_norm,
                     bfloat_cast=bfloat_cast,
+                    weight_transform=attn_weight_transform,
                 )
                 for _ in range(depth)
             ]
@@ -277,6 +287,7 @@ class CRPSLatentDiT(PhysicsNeMoModule):
         x_2: torch.Tensor,
         t: torch.Tensor | None = None,
         z_noise: torch.Tensor | None = None,
+        coarsening_level: int = 0,
     ) -> torch.Tensor:
         """Predict a normalized residual from the two input streams.
 
@@ -291,6 +302,9 @@ class CRPSLatentDiT(PhysicsNeMoModule):
         z_noise : torch.Tensor, optional
             Ensemble noise of shape (batch, embed_dim). If None, standard normal noise
             is sampled, by default None
+        coarsening_level : int, optional
+            Coarsening level passed to the attention weight transform. Ignored if no
+            transform is set, by default 0
 
         Returns
         -------
@@ -310,7 +324,7 @@ class CRPSLatentDiT(PhysicsNeMoModule):
         z_noise = self.noise_mlp(z_noise)
 
         for block in self.blocks:
-            x = block(x, cond, z_noise)
+            x = block(x, cond, z_noise, coarsening_level)
 
         x = self.final_layer(x, cond)
         x = self.unpatchify(x)

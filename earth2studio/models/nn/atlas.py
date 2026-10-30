@@ -1024,6 +1024,7 @@ class Attention(nn.Module):
         proj_drop: float = 0.0,
         norm_layer: type[torch.nn.Module] = torch.nn.LayerNorm,
         bfloat_cast: bool = True,
+        weight_transform: type[nn.Module] | None = None,
     ) -> None:
         super().__init__()
 
@@ -1038,11 +1039,18 @@ class Attention(nn.Module):
         self.attn_drop = torch.nn.Dropout(attn_drop)
         self.proj = torch.nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = torch.nn.Dropout(proj_drop)
+        self.weight_transform = (
+            weight_transform() if weight_transform is not None else None
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, coarsening_level: int = 0) -> torch.Tensor:
         B, N, C = x.shape
+        if self.weight_transform is not None and coarsening_level > 0:
+            qkv_transformed = self.weight_transform(self.qkv, coarsening_level)
+        else:
+            qkv_transformed = self.qkv
         qkv = (
-            self.qkv(x)
+            qkv_transformed(x)
             .reshape(B, N, 3, self.num_heads, self.head_dim)
             .permute(2, 0, 3, 1, 4)
         )
@@ -1097,12 +1105,12 @@ class DiTBlock(nn.Module):
             torch.nn.SiLU(), torch.nn.Linear(hidden_dim, 6 * hidden_dim, bias=True)
         )
 
-    def forward(self, x, c):
+    def forward(self, x, c, coarsening_level: int = 0):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=1)
         )
         x = x + gate_msa.unsqueeze(1) * self.attn(
-            modulate(self.norm1(x), shift_msa, scale_msa)
+            modulate(self.norm1(x), shift_msa, scale_msa), coarsening_level
         )
         x = x + gate_mlp.unsqueeze(1) * self.mlp(
             modulate(self.norm2(x), shift_mlp, scale_mlp)

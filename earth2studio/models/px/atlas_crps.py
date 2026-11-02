@@ -83,6 +83,10 @@ class AtlasCRPS(torch.nn.Module, AutoModelMixin, PrognosticMixin):
         Autoencoder decoding the low-resolution residual to full resolution.
     autoencoder_processor : nn.Module
         Autoencoder processor mapping the decoded residual back to physical units.
+    coarsening_level : int, optional
+        Take steps of ``DT * 2**coarsening_level`` instead of ``DT``, through the
+        attention weight transforms of ``model``. Levels above 0 need a model built
+        with ``attn_weight_transform``, by default 0
 
     Warning
     -------
@@ -91,6 +95,12 @@ class AtlasCRPS(torch.nn.Module, AutoModelMixin, PrognosticMixin):
     ``prep_next_input`` methods will not produce correct results, since the model
     performs autoregressive timestepping using a full-resolution physical state
     and an internal low-resolution latent state.
+
+    Note
+    ----
+    Above coarsening level 0 every lead time is in units of :attr:`step`: the history
+    input sits one coarse step before the current state, both in
+    :meth:`input_coords` and during the rollout, where it is the previous prediction.
 
     Note
     ----
@@ -121,21 +131,53 @@ class AtlasCRPS(torch.nn.Module, AutoModelMixin, PrognosticMixin):
         model_processor: nn.Module,
         autoencoder: nn.Module,
         autoencoder_processor: nn.Module,
+        coarsening_level: int = 0,
     ) -> None:
         super().__init__()
         self.model = model
         self.model_processor = model_processor
         self.autoencoder = autoencoder
         self.autoencoder_processor = autoencoder_processor
+        self.coarsening_level = coarsening_level
         self._checkpoint = bind_checkpoint_state(_AtlasCRPSCheckpointState())
         self._checkpoint_rng: torch.Tensor | None = None
+
+    @property
+    def coarsening_level(self) -> int:
+        """Coarsening level of each step; the step is ``DT * 2**coarsening_level``."""
+        return self._coarsening_level
+
+    @coarsening_level.setter
+    def coarsening_level(self, level: int) -> None:
+        if not isinstance(level, (int, np.integer)):
+            raise TypeError(f"coarsening_level must be an int, got {type(level)}")
+        if level < 0:
+            raise ValueError(f"coarsening_level must be >= 0, got {level}")
+        self._coarsening_level = int(level)
+
+    @property
+    def step(self) -> np.timedelta64:
+        """Time advanced by one forward pass at the current coarsening level."""
+        return self.DT * 2**self.coarsening_level
+
+    def _check_coarsening_level(self) -> None:
+        # Attention ignores the level when it holds no transform, so without this a
+        # coarse step would silently be a 6h step labelled with the coarse lead time.
+        if self.coarsening_level > 0 and not any(
+            getattr(module, "weight_transform", None) is not None
+            for module in self.model.modules()
+        ):
+            raise ValueError(
+                f"coarsening_level={self.coarsening_level} needs a model built with "
+                "attn_weight_transform, but it holds no attention weight transforms"
+            )
 
     def input_coords(self) -> CoordSystem:
         """Input coordinate system expected by AtlasCRPS.
 
         Notes
         -----
-        - Lead times are fixed to [-6h, 0h].
+        - Lead times are fixed to [-step, 0h], i.e. [-6h, 0h] at coarsening level 0.
         - Variables are defined by the `VARIABLES` of the Atlas model.
         - Spatial grid is 0.25 degree lat-lon: 721 latitudes, 1440 longitudes.
 
@@ -152,7 +194,7 @@ class AtlasCRPS(torch.nn.Module, AutoModelMixin, PrognosticMixin):
             {
                 "batch": np.empty(0),
                 "time": np.empty(0),
-                "lead_time": np.array([-self.DT, np.timedelta64(0, "h")]),
+                "lead_time": np.array([-self.step, np.timedelta64(0, "h")]),
                 "variable": np.array(VARIABLES),
                 "lat": np.linspace(90.0, -90.0, 721, dtype=np.float32),
                 "lon": np.linspace(
@@ -168,7 +210,7 @@ class AtlasCRPS(torch.nn.Module, AutoModelMixin, PrognosticMixin):
 
     @batch_coords()
     def output_coords(self, input_coords: CoordSystem) -> CoordSystem:
-        """Output coordinate system produced by a single AtlasCRPS step (t+6h).
+        """Output coordinate system produced by a single AtlasCRPS step (t+step).
 
         Parameters
         ----------
@@ -180,7 +222,7 @@ class AtlasCRPS(torch.nn.Module, AutoModelMixin, PrognosticMixin):
         CoordSystem
             Ordered dictionary with keys:
             - 'time' : np.ndarray[np.datetime64] (copied from input if present)
-            - 'lead_time' : np.timedelta64 set to +6h
+            - 'lead_time' : np.timedelta64 set to +step
             - 'variable' : np.ndarray[str] matching `VARIABLES`
             - 'lat' : np.ndarray[float] (copied from input if present, else 721 values)
             - 'lon' : np.ndarray[float] (copied from input if present, else 1440 values)
@@ -189,7 +231,7 @@ class AtlasCRPS(torch.nn.Module, AutoModelMixin, PrognosticMixin):
             {
                 "batch": np.empty(0),
                 "time": np.empty(0),
-                "lead_time": np.array([self.DT]),
+                "lead_time": np.array([self.step]),
                 "variable": np.array(VARIABLES),
                 "lat": np.linspace(90.0, -90.0, 721, dtype=np.float32),
                 "lon": np.linspace(
@@ -250,7 +292,7 @@ class AtlasCRPS(torch.nn.Module, AutoModelMixin, PrognosticMixin):
         # Shift the previous latest step to the earlier position
         x_next[:, :, :1, :, :, :] = x[:, :, 1:, :, :, :]
         coords_next = coords.copy()
-        coords_next["lead_time"] = coords_next["lead_time"] + self.DT
+        coords_next["lead_time"] = coords_next["lead_time"] + self.step
         return x_next, coords_next
 
     @torch.inference_mode()
@@ -260,13 +302,13 @@ class AtlasCRPS(torch.nn.Module, AutoModelMixin, PrognosticMixin):
         coords: CoordSystem,
         prev_latents: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        """Forward pass of the prognostic model, integrating a single 6h step.
+        """Forward pass of the prognostic model, integrating a single step.
 
         Parameters
         ----------
         x : torch.Tensor
             Input tensor of shape (lead_time, variable, lat, lon) corresponding to the
-            coordinate system. Lead times expected: [-6h, 0h].
+            coordinate system. Lead times expected: [-step, 0h].
         coords : CoordSystem
             Coordinate dictionary describing `x`.
         prev_latents : tuple[torch.Tensor, torch.Tensor], optional
@@ -277,7 +319,7 @@ class AtlasCRPS(torch.nn.Module, AutoModelMixin, PrognosticMixin):
         Returns
         -------
         tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
-            Tuple containing the decoded forecast at t+6h and the history and current
+            Tuple containing the decoded forecast at t+step and the history and current
             latents to use for the following step.
         """
 
@@ -307,7 +349,12 @@ class AtlasCRPS(torch.nn.Module, AutoModelMixin, PrognosticMixin):
             low_res = prev_latents[1].clone()
 
         conditioning = self.model_processor.preprocess_conditioning(high_res, low_res)
-        residual_latent = self.model(prev, conditioning)
+        if self.coarsening_level > 0:
+            residual_latent = self.model(
+                prev, conditioning, coarsening_level=self.coarsening_level
+            )
+        else:
+            residual_latent = self.model(prev, conditioning)
 
         # Decode the latent residual and return to state space
         pred = self.autoencoder(high_res, residual_latent)
@@ -327,21 +374,22 @@ class AtlasCRPS(torch.nn.Module, AutoModelMixin, PrognosticMixin):
     def __call__(
         self, x: torch.Tensor, coords: CoordSystem
     ) -> tuple[torch.Tensor, CoordSystem]:
-        """Forward pass of the prognostic model, integrating a single 6h step.
+        """Forward pass of the prognostic model, integrating a single step.
 
         Parameters
         ----------
         x : torch.Tensor
             Input tensor of shape (..., lead_time, variable, lat, lon) corresponding
-            to the coordinate system. Lead times expected: [-6h, 0h].
+            to the coordinate system. Lead times expected: [-step, 0h].
         coords : CoordSystem
             Coordinate dictionary describing `x`.
 
         Returns
         -------
         tuple[torch.Tensor, CoordSystem]
-            Output tensor advanced to t+6h and its coordinate system.
+            Output tensor advanced to t+step and its coordinate system.
         """
+        self._check_coarsening_level()
 
         # Sanitize NaNs in input sst
         if torch.isnan(x).any():
@@ -375,6 +423,7 @@ class AtlasCRPS(torch.nn.Module, AutoModelMixin, PrognosticMixin):
         list[list[tuple[torch.Tensor, torch.Tensor] | None]],
     ]:
         """Internal helper that handles cached latents during autoregressive rollout."""
+        self._check_coarsening_level()
 
         # Sanitize NaNs in input sst
         if torch.isnan(x).any():
@@ -403,7 +452,7 @@ class AtlasCRPS(torch.nn.Module, AutoModelMixin, PrognosticMixin):
     def create_iterator(
         self, x: torch.Tensor, coords: CoordSystem
     ) -> Iterator[tuple[torch.Tensor, CoordSystem]]:
-        """Create an iterator that yields the initial state then successive 6h steps.
+        """Create an iterator that yields the initial state then successive steps.
 
         Parameters
         ----------

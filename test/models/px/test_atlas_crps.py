@@ -229,6 +229,85 @@ def test_atlas_crps_iter(ensemble, atlas_crps_test_components, device):
             break
 
 
+class PhooCoarseningModel(PhooAtlasCRPSModel):
+    """Dummy model holding a weight transform and recording the levels it is given."""
+
+    def __init__(self, n_vars: int = 75):
+        super().__init__(delta_t=6, n_vars=n_vars)
+        self.weight_transform = torch.nn.Identity()
+        self.levels: list[int] = []
+
+    def forward(self, x_1, x_2, coarsening_level=0):
+        self.levels.append(coarsening_level)
+        return super().forward(x_1, x_2)
+
+
+class PhooDateRecordingProcessor(PhooProcessor):
+    """Dummy processor recording the date each step's zenith angle is computed at."""
+
+    def __init__(self):
+        super().__init__()
+        self.dates: list = []
+
+    def preprocess_input(self, x, current_date):
+        self.dates.append(current_date[0, 0])
+        return x, x
+
+
+@pytest.mark.parametrize("coarsening_level", [1, 2])
+def test_atlas_crps_coarsening_iter(coarsening_level, atlas_crps_test_components):
+    """Every lead time, the history window and the zenith date follow the coarse step."""
+    model = PhooCoarseningModel()
+    processor = PhooDateRecordingProcessor()
+    components = {
+        **atlas_crps_test_components,
+        "model": model,
+        "model_processor": processor,
+    }
+    p = AtlasCRPS(**components, coarsening_level=coarsening_level)
+    step = np.timedelta64(6 * 2**coarsening_level, "h")
+    assert p.step == step
+
+    lead_time = p.input_coords()["lead_time"]
+    np.testing.assert_array_equal(lead_time, np.array([-step, np.timedelta64(0, "h")]))
+
+    dc = p.input_coords()
+    for key in ["batch", "time", "lead_time", "variable"]:
+        del dc[key]
+    time = np.array([np.datetime64("1993-04-05T00:00")])
+    x, coords = fetch_data(Random(dc), time, p.input_coords()["variable"], lead_time)
+    x, coords = x.unsqueeze(0), OrderedDict(batch=np.arange(1), **coords)
+
+    p_iter = p.create_iterator(x, coords)
+    next(p_iter)
+    for i, (_, out_coords) in enumerate(p_iter):
+        assert out_coords["lead_time"][0] == step * (i + 1)
+        if i == 2:
+            break
+
+    assert model.levels == [coarsening_level] * 3
+    expected_dates = [time[0] + step * k for k in range(3)]
+    assert [np.datetime64(d) for d in processor.dates] == expected_dates
+
+    # The history input of the next step is the previous prediction, one step back.
+    x_next, coords_next = p.prep_next_input(x[:, :, 1:], coords, x, coords)
+    np.testing.assert_array_equal(coords_next["lead_time"], lead_time + step)
+    assert torch.equal(x_next[:, :, :1], x[:, :, 1:])
+
+
+def test_atlas_crps_coarsening_level_validation(atlas_crps_test_components):
+    """Invalid levels are refused, as is a coarse step on a model with no transforms."""
+    for bad, error in [(-1, ValueError), (1.0, TypeError)]:
+        with pytest.raises(error):
+            AtlasCRPS(**atlas_crps_test_components, coarsening_level=bad)
+
+    p = AtlasCRPS(**atlas_crps_test_components)
+    assert p.coarsening_level == 0 and p.step == np.timedelta64(6, "h")
+    p.coarsening_level = 1
+    with pytest.raises(ValueError, match="attn_weight_transform"):
+        p._check_coarsening_level()
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda:0"])
 @pytest.mark.parametrize("stop", [0, 2])
 def test_atlas_crps_checkpoint_state_round_trip(
